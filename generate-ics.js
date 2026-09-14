@@ -44,7 +44,7 @@ function isDeload(week) {
 
 // duration ranges (minutes) per phase, by session type
 const RANGES = {
-  gym:        { base: [45, 55], build1: [40, 50], build2: [35, 45], peak: [25, 35], taper: [20, 25] },
+  gym:        { base: [55, 65], build1: [50, 60], build2: [45, 55], peak: [30, 40], taper: [20, 25] },
   swim:       { base: [45, 60], build1: [60, 75], build2: [75, 90], peak: [85, 90], taper: [30, 45] },
   swim2:      { build1: [30, 35], build2: [35, 40] }, // second, easy build-phase swim
   bikeInt:    { base: [45, 60], build1: [60, 75], build2: [75, 90], peak: [90, 75], taper: [30, 45] },
@@ -96,9 +96,39 @@ const GYM = {
   },
 };
 
+// Midsection/chest finisher, appended to every gym day. Note: this builds
+// and tightens the muscle under the fat (obliques, rectus abdominis, chest)
+// — it does not spot-reduce belly/love-handle fat. Visible change there
+// comes from overall body-fat drop (nutrition + the training volume you're
+// already doing), not from which muscle you isolate.
+const CORE = {
+  A: { // paired with lower-body day — lower-ab / anti-extension focus
+    base:   'Finisher: Hanging Knee Raise 3x12, Side Plank 3x30s/side.',
+    build1: 'Finisher: Hanging Leg Raise 3x10, Cable Woodchopper 3x12/side (obliques).',
+    build2: 'Finisher: Weighted Hanging Leg Raise 3x8, Ab Wheel Rollout 3x8.',
+    peak:   'Finisher: Hollow Body Hold 3x30s, Pallof Press 2x12/side (maintenance).',
+    taper:  'Finisher: Dead Bug 2x10/side, easy stretching. Keep it light.',
+  },
+  B: { // paired with upper-body day — chest + oblique focus
+    base:   'Finisher: Incline DB Press 3x10 (chest), Russian Twist 3x20, Side Plank 3x30s/side.',
+    build1: 'Finisher: Cable Flye 3x12 (chest), Weighted Russian Twist 3x16, Suitcase Carry 3x20m/side.',
+    build2: 'Finisher: Incline DB Press 3x8 (chest), Landmine Rotation 3x10/side, Ab Wheel Rollout 3x8.',
+    peak:   'Finisher: DB Flye 2x12 (light, maintenance), Side Plank 2x30s/side.',
+    taper:  'Finisher: light chest band activation, easy stretching.',
+  },
+  C: { // paired with full-body day — rotational / full core focus
+    base:   'Finisher: Cable Woodchopper 3x12/side, Reverse Crunch 3x15.',
+    build1: 'Finisher: Med-ball Rotational Throw 3x8/side, Hanging Leg Raise 3x10.',
+    build2: 'Finisher: Landmine Rotation 3x10/side, Weighted Plank 3x40s.',
+    peak:   'Finisher: Pallof Press 2x12/side, Hollow Hold 2x30s (maintenance).',
+    taper:  'Finisher: easy core activation + mobility.',
+  },
+};
+
 function gymText(dayLetter, phase) {
   const work = GYM[dayLetter][phase] || GYM[dayLetter].taper;
-  return `${work} Load = RPE/reps-in-reserve, not a fixed kg — pick a weight where the last rep of the last set matches the stated RPE (no 1RM on file, this self-corrects as you get stronger).`;
+  const core = CORE[dayLetter][phase] || CORE[dayLetter].taper;
+  return `${work} ${core} Load = RPE/reps-in-reserve, not a fixed kg — pick a weight where the last rep of the last set matches the stated RPE (no 1RM on file, this self-corrects as you get stronger).`;
 }
 
 // ---- endurance session prescriptions (structure + computed distance) --
