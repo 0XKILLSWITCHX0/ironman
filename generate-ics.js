@@ -202,6 +202,102 @@ const TITLES = {
   runLong: 'Long Run',
 };
 
+// ---- class-feed conflict avoidance ------------------------------------
+// classes.ics is fetched locally via fetch-classes.sh (gitignored — the
+// Canvas URL carries a personal token, never committed). If it's missing,
+// training just generates with no conflict checks, same as before.
+const BERLIN_FMT = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hour12: false,
+});
+
+function icsUtcToDate(s) {
+  // s = YYYYMMDDTHHMMSSZ
+  return new Date(Date.UTC(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8), +s.slice(9, 11), +s.slice(11, 13), +s.slice(13, 15)));
+}
+
+function berlinParts(date) {
+  const parts = BERLIN_FMT.formatToParts(date);
+  const get = (t) => parts.find((p) => p.type === t).value;
+  return { dateStr: `${get('year')}${get('month')}${get('day')}`, minutes: (+get('hour')) * 60 + (+get('minute')) };
+}
+
+function parseClasses(path) {
+  const busy = new Map();
+  if (!fs.existsSync(path)) return busy;
+  const unfolded = fs.readFileSync(path, 'utf8').replace(/\r?\n[ \t]/g, '');
+  const blocks = unfolded.split('BEGIN:VEVENT').slice(1);
+  for (const block of blocks) {
+    const startMatch = block.match(/DTSTART(?:;[^:\n]*)?:(\d{8}T\d{6}Z)/);
+    const endMatch = block.match(/DTEND(?:;[^:\n]*)?:(\d{8}T\d{6}Z)/);
+    if (!startMatch || !endMatch) continue; // skip all-day / VALUE=DATE entries
+    const start = berlinParts(icsUtcToDate(startMatch[1]));
+    const end = berlinParts(icsUtcToDate(endMatch[1]));
+    if (start.dateStr !== end.dateStr) continue; // skip multi-day spans
+    const list = busy.get(start.dateStr) || [];
+    list.push([start.minutes, end.minutes]);
+    busy.set(start.dateStr, list);
+  }
+  return busy;
+}
+
+const CLASS_BUSY = parseClasses('classes.ics');
+if (CLASS_BUSY.size === 0) {
+  console.log('No classes.ics found (or empty) — run ./fetch-classes.sh to enable class-conflict avoidance.');
+} else {
+  console.log(`Loaded class schedule: ${CLASS_BUSY.size} days with classes.`);
+}
+
+function overlaps(aStart, aEnd, bStart, bEnd) {
+  return aStart < bEnd && bStart < aEnd;
+}
+
+// search outward from the desired time for a free slot within [minMin,maxMin)
+function resolveSlot(dateStr, desiredMin, durationMin, minMin, maxMin, step = 15) {
+  const busy = CLASS_BUSY.get(dateStr) || [];
+  const isFree = (start) => {
+    const end = start + durationMin;
+    if (start < minMin || end > maxMin) return false;
+    return !busy.some(([bs, be]) => overlaps(start, end, bs, be));
+  };
+  if (isFree(desiredMin)) return { minutes: desiredMin, moved: false };
+  const candidates = [];
+  for (let t = desiredMin + step; t + durationMin <= maxMin; t += step) candidates.push(t);
+  for (let t = desiredMin - step; t >= minMin; t -= step) candidates.push(t);
+  for (const t of candidates) {
+    if (isFree(t)) return { minutes: t, moved: true };
+  }
+  return null; // no free slot in the allowed window
+}
+
+// per-type allowed windows for auto-shifting around classes
+const BOUNDS = {
+  gym:      { minMin: 5 * 60 + 30, maxMin: 8 * 60 },       // must stay before 8AM
+  swim:     { minMin: 17 * 60, maxMin: 22 * 60 },
+  swim2:    { minMin: 6 * 60, maxMin: 8 * 60 },
+  runInt:   { minMin: 17 * 60, maxMin: 22 * 60 },           // must stay after 5PM-ish evening window
+  bikeInt:  { minMin: 17 * 60, maxMin: 22 * 60 },           // must stay after 5PM
+  bikeLong: { minMin: 6 * 60, maxMin: 20 * 60 },
+  runLong:  { minMin: 6 * 60, maxMin: 20 * 60 },
+};
+
+// resolves (hh,mm) around any class on that date; returns a description
+// suffix explaining a shift or flagging an unresolved conflict.
+function placeSession(type, dateObj, desiredHH, desiredMM, durationMin) {
+  const dateStr = fmtDate(dateObj);
+  const { minMin, maxMin } = BOUNDS[type];
+  const desiredMin = desiredHH * 60 + desiredMM;
+  const result = resolveSlot(dateStr, desiredMin, durationMin, minMin, maxMin);
+  const original = `${String(desiredHH).padStart(2, '0')}:${String(desiredMM).padStart(2, '0')}`;
+  if (!result) {
+    return { hh: desiredHH, mm: desiredMM, tag: ' ⚠️ CLASS CONFLICT', suffix: `⚠️ CLASS CONFLICT: overlaps a class and no free slot was found in the allowed window — reschedule manually.` };
+  }
+  const hh = Math.floor(result.minutes / 60);
+  const mm = result.minutes % 60;
+  if (!result.moved) return { hh, mm, tag: '', suffix: '' };
+  return { hh, mm, tag: ' (moved)', suffix: `Shifted from ${original} to avoid a class.` };
+}
+
 // ---- date helpers (floating local time, no TZID — always shows at
 // wall-clock time in whatever timezone the calendar app is set to) ----
 function addDays(dateStr, days) {
@@ -249,28 +345,36 @@ function vevent({ uid, day, hh, mm, durationMin, summary, description }) {
 
 function buildEvents() {
   const events = [];
+  let conflictCount = 0;
+
+  // pushes one session, auto-shifted around any class on that date
+  function push(type, uid, day, desiredHH, desiredMM, durationMin, title, description) {
+    const placed = placeSession(type, day, desiredHH, desiredMM, durationMin);
+    if (placed.tag === ' ⚠️ CLASS CONFLICT') conflictCount++;
+    events.push(vevent({
+      uid, day, hh: placed.hh, mm: placed.mm, durationMin,
+      summary: title + placed.tag,
+      description: placed.suffix ? `${description} [${placed.suffix}]` : description,
+    }));
+  }
 
   for (let week = 1; week <= CONFIG.raceSundayWeek; week++) {
     const monday = addDays(CONFIG.startMonday, (week - 1) * 7);
+    const tue = addDays(CONFIG.startMonday, (week - 1) * 7 + 1);
+    const wed = addDays(CONFIG.startMonday, (week - 1) * 7 + 2);
+    const thu = addDays(CONFIG.startMonday, (week - 1) * 7 + 3);
+    const fri = addDays(CONFIG.startMonday, (week - 1) * 7 + 4);
+    const sat = addDays(CONFIG.startMonday, (week - 1) * 7 + 5);
+    const sun = addDays(CONFIG.startMonday, (week - 1) * 7 + 6);
     const phase = phaseOf(week).name;
     const weekTag = isDeload(week) ? ' [recovery week]' : '';
 
     if (phase === 'race') {
-      const sunday = addDays(CONFIG.startMonday, (week - 1) * 7 + 6);
+      push('swim2', `w${week}-mon-swim`, monday, 7, 0, 15, 'Shakeout Swim (race week)', 'Very easy, a few hundred meters, loosen up. Race is Sunday.');
+      push('bikeInt', `w${week}-wed-bike`, wed, 17, 30, 20, 'Shakeout Spin (race week)', 'Easy spin, a few openers at race pace. Keep legs fresh.');
+      push('runInt', `w${week}-thu-run`, thu, 18, 0, 15, 'Shakeout Run (race week)', 'Very easy jog + strides. Race is Sunday — rest is the workout now.');
       events.push(vevent({
-        uid: `w${week}-mon-swim`, day: monday, hh: 7, mm: 0, durationMin: 15,
-        summary: 'Shakeout Swim (race week)', description: 'Very easy, a few hundred meters, loosen up. Race is Sunday.',
-      }));
-      events.push(vevent({
-        uid: `w${week}-wed-bike`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 2), hh: 17, mm: 30, durationMin: 20,
-        summary: 'Shakeout Spin (race week)', description: 'Easy spin, a few openers at race pace. Keep legs fresh.',
-      }));
-      events.push(vevent({
-        uid: `w${week}-thu-run`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 3), hh: 18, mm: 0, durationMin: 15,
-        summary: 'Shakeout Run (race week)', description: 'Very easy jog + strides. Race is Sunday — rest is the workout now.',
-      }));
-      events.push(vevent({
-        uid: `w${week}-sun-race`, day: sunday, hh: 6, mm: 30, durationMin: 16 * 60,
+        uid: `w${week}-sun-race`, day: sun, hh: 6, mm: 30, durationMin: 16 * 60,
         summary: 'IRONMAN — RACE DAY 🏁', description: '3.8km swim / 180km bike / 42.2km run. Trust the training. Nutrition plan, pacing plan, gear laid out night before.',
       }));
       continue;
@@ -283,57 +387,28 @@ function buildEvents() {
     const runIntMin = minutesFor('runInt', week);
     const runLongMin = minutesFor('runLong', week);
 
-    events.push(vevent({
-      uid: `w${week}-mon-gym`, day: monday, hh: 6, mm: 30, durationMin: gymMin,
-      summary: TITLES.gym + weekTag, description: gymText('A', phase),
-    }));
-    events.push(vevent({
-      uid: `w${week}-mon-swim`, day: monday, hh: 18, mm: 0, durationMin: swimMin,
-      summary: TITLES.swim + weekTag, description: swimText(phase, swimMin),
-    }));
-    events.push(vevent({
-      uid: `w${week}-tue-run`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 1), hh: 18, mm: 0, durationMin: runIntMin,
-      summary: TITLES.runInt + weekTag, description: runIntText(phase),
-    }));
-    events.push(vevent({
-      uid: `w${week}-wed-gym`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 2), hh: 6, mm: 30, durationMin: gymMin,
-      summary: TITLES.gym + weekTag, description: gymText('B', phase),
-    }));
-    events.push(vevent({
-      uid: `w${week}-wed-bike`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 2), hh: 17, mm: 30, durationMin: bikeIntMin,
-      summary: TITLES.bikeInt + weekTag, description: bikeIntText(phase, bikeIntMin),
-    }));
+    push('gym', `w${week}-mon-gym`, monday, 6, 30, gymMin, TITLES.gym + weekTag, gymText('A', phase));
+    push('swim', `w${week}-mon-swim`, monday, 18, 0, swimMin, TITLES.swim + weekTag, swimText(phase, swimMin));
+    push('runInt', `w${week}-tue-run`, tue, 18, 0, runIntMin, TITLES.runInt + weekTag, runIntText(phase));
+    push('gym', `w${week}-wed-gym`, wed, 6, 30, gymMin, TITLES.gym + weekTag, gymText('B', phase));
+    push('bikeInt', `w${week}-wed-bike`, wed, 17, 30, bikeIntMin, TITLES.bikeInt + weekTag, bikeIntText(phase, bikeIntMin));
 
     // second, easy swim during build phase only
     if (phase === 'build1' || phase === 'build2') {
       const swim2Min = minutesFor('swim2', week);
-      events.push(vevent({
-        uid: `w${week}-thu-swim`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 3), hh: 6, mm: 45, durationMin: swim2Min,
-        summary: TITLES.swim2 + weekTag,
-        description: `Easy technique swim, separate from Monday's session — keeps swim frequency up without adding fatigue. ${swimText('base', swim2Min)}`,
-      }));
+      push('swim2', `w${week}-thu-swim`, thu, 6, 45, swim2Min, TITLES.swim2 + weekTag,
+        `Easy technique swim, separate from Monday's session — keeps swim frequency up without adding fatigue. ${swimText('base', swim2Min)}`);
     }
 
-    events.push(vevent({
-      uid: `w${week}-thu-run`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 3), hh: 18, mm: 0, durationMin: runIntMin,
-      summary: TITLES.runInt + weekTag, description: runIntText(phase),
-    }));
-    events.push(vevent({
-      uid: `w${week}-fri-gym`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 4), hh: 6, mm: 30, durationMin: gymMin,
-      summary: TITLES.gym + weekTag, description: gymText('C', phase),
-    }));
-    events.push(vevent({
-      uid: `w${week}-fri-bike`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 4), hh: 17, mm: 30, durationMin: bikeIntMin,
-      summary: TITLES.bikeInt + weekTag, description: bikeIntText(phase, bikeIntMin),
-    }));
-    events.push(vevent({
-      uid: `w${week}-sat-bike`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 5), hh: 7, mm: 0, durationMin: bikeLongMin,
-      summary: TITLES.bikeLong + weekTag, description: bikeLongText(phase, bikeLongMin),
-    }));
-    events.push(vevent({
-      uid: `w${week}-sun-run`, day: addDays(CONFIG.startMonday, (week - 1) * 7 + 6), hh: 7, mm: 30, durationMin: runLongMin,
-      summary: TITLES.runLong + weekTag, description: runLongText(phase, runLongMin),
-    }));
+    push('runInt', `w${week}-thu-run`, thu, 18, 0, runIntMin, TITLES.runInt + weekTag, runIntText(phase));
+    push('gym', `w${week}-fri-gym`, fri, 6, 30, gymMin, TITLES.gym + weekTag, gymText('C', phase));
+    push('bikeInt', `w${week}-fri-bike`, fri, 17, 30, bikeIntMin, TITLES.bikeInt + weekTag, bikeIntText(phase, bikeIntMin));
+    push('bikeLong', `w${week}-sat-bike`, sat, 7, 0, bikeLongMin, TITLES.bikeLong + weekTag, bikeLongText(phase, bikeLongMin));
+    push('runLong', `w${week}-sun-run`, sun, 7, 30, runLongMin, TITLES.runLong + weekTag, runLongText(phase, runLongMin));
+  }
+
+  if (conflictCount > 0) {
+    console.log(`${conflictCount} session(s) could not be auto-resolved around your classes — look for "⚠️ CLASS CONFLICT" in the calendar.`);
   }
 
   return events;
